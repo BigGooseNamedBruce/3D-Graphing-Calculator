@@ -1,0 +1,49 @@
+# ---- Build output ----------------------------------------------------------
+build/
+out/
+bin/
+cmake-build-*/
+
+# ---- CMake -----------------------------------------------------------------
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+
+# ---- Generated shader binaries (glslc emits these into the build tree) -----
+*.spv
+
+# ---- Binaries, objects, debug info -----------------------------------------
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# ---- IDE / editor -----------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.sln
+*.vcxproj*
+compile_commands.json
+
+# ---- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# ---- Not part of this project ----------------------------------------------
+# Stray tool logs. Nothing here is source; do not publish it.
+logs/
