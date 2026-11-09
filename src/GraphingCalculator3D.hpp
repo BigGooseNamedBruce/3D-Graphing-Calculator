@@ -91,8 +91,8 @@ constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 // single extra evaluation.
 //
 // Vertex count is the only thing that costs CPU time: every rebuild is
-// RESOLUTION^2 * 5 expression evaluations, on one background thread. Reach and
-// falloff are free; resolution is not.
+// RESOLUTION^2 vertices, each box-filtered over its own cell, spread across all
+// cores. Reach and falloff are free; resolution is not.
 //
 // MESH_RESOLUTION must be used everywhere a mesh is built: the vertex buffer is
 // sized from the first mesh generated and every later snapshot is memcpy'd into
@@ -119,6 +119,13 @@ constexpr float FAR_PLANE = 5000.0f;
 // Half-extent of the camera-centred ground quad. The grid fades out well
 // inside this, so its edge is never visible.
 constexpr float GRID_EXTENT = 2000.0f;
+
+// Ceiling on multisampling. The far field is mostly triangles a pixel or two
+// across, so their edges are where the remaining aliasing lives; 4x takes the
+// stair-stepping off them, and 8x costs the bandwidth again for little more.
+// The spec floor for both colour and depth sample counts includes 4x, so this
+// is always what a device ends up with.
+constexpr VkSampleCountFlagBits MAX_MSAA_SAMPLES = VK_SAMPLE_COUNT_4_BIT;
 
 inline const std::vector<const char*> kValidationLayers = {
     "VK_LAYER_KHRONOS_validation"};
@@ -174,6 +181,12 @@ public:
         return *this;
     }
 
+    // Must match the render pass, which is multisampled.
+    PipelineBuilder& setSampleCount(VkSampleCountFlagBits samples) {
+        samples_ = samples;
+        return *this;
+    }
+
     VkPipeline build(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout) {
         VkShaderModule vert = loadShader(device, vertPath_);
         VkShaderModule frag = loadShader(device, fragPath_);
@@ -213,7 +226,7 @@ public:
 
         VkPipelineMultisampleStateCreateInfo multisample{};
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = samples_;
 
         VkPipelineDepthStencilStateCreateInfo depthStencil{};
         depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -275,6 +288,7 @@ private:
     bool hasBinding_ = false;
     std::vector<VkVertexInputAttributeDescription> attrs_;
     VkPrimitiveTopology topology_ = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
     bool alphaBlend_ = false;
     bool depthWrite_ = true;
 
@@ -302,9 +316,11 @@ private:
 
 class GraphingCalculator3D {
 public:
+    // An opaque callable could depend on anything, so it is assumed to animate
+    // and the producer keeps rebuilding it. install() below knows better for
+    // parsed expressions.
     void setFunction(std::function<float(float, float, float)> f) {
-        std::lock_guard<std::mutex> lock(funcMutex_);
-        func_ = std::move(f);
+        install(std::move(f), true);
     }
 
     // Compile and install a source expression, e.g. "sin(3x)*cos(3y) + 0.2t".
@@ -317,8 +333,7 @@ public:
             }
             return false;
         }
-        auto compiled = std::make_shared<const expr::Expression>(std::move(r.expression));
-        setFunction([compiled](float x, float y, float t) { return compiled->eval(x, y, t); });
+        installCompiled(std::move(r.expression));
         activeSource_ = source;
         std::snprintf(inputBuf_, sizeof(inputBuf_), "%s", source.c_str());
         return true;
@@ -372,9 +387,16 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
 
+    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_1_BIT; // set when the GPU is picked
+
     VkImage depthImage_ = VK_NULL_HANDLE;
     VkDeviceMemory depthImageMemory_ = VK_NULL_HANDLE;
     VkImageView depthImageView_ = VK_NULL_HANDLE;
+
+    // Multisampled colour target, resolved into the swapchain image.
+    VkImage colorImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory colorImageMemory_ = VK_NULL_HANDLE;
+    VkImageView colorImageView_ = VK_NULL_HANDLE;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
@@ -400,7 +422,14 @@ private:
     struct Snapshot { std::vector<Vertex> vertices; };
     Snapshot ring_[RING_SIZE];
     std::atomic<uint32_t> writeIdx_{0}; // producer increments after each write
+    uint32_t uploadedIdx_ = 0; // render thread: writeIdx_ as of the last upload
     void* vertexMapped_ = nullptr; // persistent CPU-side pointer into vertexBuffer_
+
+    // Bumped whenever func_ is replaced, so the producer can tell a new surface
+    // from one it has already built. Animated surfaces are rebuilt every pass
+    // regardless; still ones only when this or the patch centre changes.
+    std::atomic<uint32_t> funcGeneration_{0};
+    std::atomic<bool> funcAnimated_{false};
 
     std::thread producerThread_;
     std::atomic<bool> producerRunning_{false};
@@ -465,15 +494,29 @@ private:
         }
         parseError_.clear();
         activeSource_ = inputBuf_;
+        installCompiled(std::move(r.expression));
+    }
 
-        // Shared, immutable, and captured by value: the producer thread keeps a
-        // live reference for as long as it is mid-snapshot, so replacing func_
-        // here cannot pull the expression out from under it.
-        auto compiled = std::make_shared<const expr::Expression>(std::move(r.expression));
+    // Shared, immutable, and captured by value: the producer thread keeps a live
+    // reference for as long as it is mid-snapshot, so replacing func_ here
+    // cannot pull the expression out from under it.
+    void installCompiled(expr::Expression parsed) {
+        auto compiled = std::make_shared<const expr::Expression>(std::move(parsed));
+        install([compiled](float x, float y, float t) { return compiled->eval(x, y, t); },
+                compiled->usesTime());
+    }
+
+    // The generation counter is what tells the producer a new surface is
+    // waiting; without it a swap to a different static expression would be
+    // indistinguishable from no change at all and never get rebuilt. Bumped
+    // last, so the producer that observes it also observes the new func_.
+    void install(std::function<float(float, float, float)> f, bool animated) {
         {
             std::lock_guard<std::mutex> lock(funcMutex_);
-            func_ = [compiled](float x, float y, float t) { return compiled->eval(x, y, t); };
+            func_ = std::move(f);
         }
+        funcAnimated_.store(animated, std::memory_order_relaxed);
+        funcGeneration_.fetch_add(1, std::memory_order_release);
     }
 
     void processInput() {
@@ -506,6 +549,7 @@ private:
         createGraphicsPipeline();
         createGridPipeline();
         createCommandPool();
+        createColorResources();
         createDepthResources();
         createFramebuffers();
         createMeshBuffers();
@@ -731,6 +775,23 @@ private:
         if (physicalDevice_ == VK_NULL_HANDLE) {
             throw std::runtime_error("no suitable GPU found");
         }
+        msaaSamples_ = maxUsableSampleCount();
+    }
+
+    // Colour and depth are resolved out of the same subpass, so only counts
+    // both attachments can be created with are usable.
+    VkSampleCountFlagBits maxUsableSampleCount() {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevice_, &props);
+        const VkSampleCountFlags counts = props.limits.framebufferColorSampleCounts &
+                                          props.limits.framebufferDepthSampleCounts;
+        for (VkSampleCountFlagBits bit : {VK_SAMPLE_COUNT_8_BIT, VK_SAMPLE_COUNT_4_BIT,
+                                          VK_SAMPLE_COUNT_2_BIT}) {
+            if (bit <= cfg::MAX_MSAA_SAMPLES && (counts & bit)) {
+                return bit;
+            }
+        }
+        return VK_SAMPLE_COUNT_1_BIT;
     }
 
     void createLogicalDevice() {
@@ -914,8 +975,9 @@ private:
             VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
     }
 
-    void createImage(uint32_t w, uint32_t h, VkFormat format, VkImageTiling tiling,
-                     VkImageUsageFlags usage, VkMemoryPropertyFlags props,
+    void createImage(uint32_t w, uint32_t h, VkFormat format, VkSampleCountFlagBits samples,
+                     VkImageTiling tiling, VkImageUsageFlags usage,
+                     VkMemoryPropertyFlags props,
                      VkImage& image, VkDeviceMemory& memory) {
         VkImageCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -927,7 +989,7 @@ private:
         ci.tiling = tiling;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         ci.usage = usage;
-        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.samples = samples;
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (vkCreateImage(device_, &ci, nullptr, &image) != VK_SUCCESS) {
             throw std::runtime_error("failed to create image");
@@ -947,27 +1009,41 @@ private:
 
     void createDepthResources() {
         VkFormat depthFormat = findDepthFormat();
-        createImage(swapChainExtent_.width, swapChainExtent_.height, depthFormat,
+        createImage(swapChainExtent_.width, swapChainExtent_.height, depthFormat, msaaSamples_,
                     VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage_, depthImageMemory_);
         depthImageView_ = createImageView(depthImage_, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
     }
 
+    // The multisampled colour buffer everything is drawn into. It is resolved
+    // down to the swapchain image at the end of the subpass and never read
+    // afterwards, hence TRANSIENT: a tiler can keep it entirely on-chip.
+    void createColorResources() {
+        createImage(swapChainExtent_.width, swapChainExtent_.height, swapChainImageFormat_,
+                    msaaSamples_, VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, colorImage_, colorImageMemory_);
+        colorImageView_ = createImageView(colorImage_, swapChainImageFormat_,
+                                          VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+
     // ---------------------------------------------------------------- render pass
     void createRenderPass() {
+        // Rendering target: multisampled, and discarded once resolved, so it is
+        // never stored and never presented.
         VkAttachmentDescription color{};
         color.format = swapChainImageFormat_;
-        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.samples = msaaSamples_;
         color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
         VkAttachmentDescription depth{};
         depth.format = findDepthFormat();
-        depth.samples = VK_SAMPLE_COUNT_1_BIT;
+        depth.samples = msaaSamples_;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -975,13 +1051,27 @@ private:
         depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+        // The swapchain image, which only ever receives the resolve. Its prior
+        // contents are irrelevant, so it is not loaded.
+        VkAttachmentDescription resolve{};
+        resolve.format = swapChainImageFormat_;
+        resolve.samples = VK_SAMPLE_COUNT_1_BIT;
+        resolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        resolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        resolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        resolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        resolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
         VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference resolveRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorRef;
+        subpass.pResolveAttachments = &resolveRef;
         subpass.pDepthStencilAttachment = &depthRef;
 
         VkSubpassDependency dep{};
@@ -995,7 +1085,7 @@ private:
         dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
-        std::array<VkAttachmentDescription, 2> attachments = {color, depth};
+        std::array<VkAttachmentDescription, 3> attachments = {color, depth, resolve};
         VkRenderPassCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         ci.attachmentCount = static_cast<uint32_t>(attachments.size());
@@ -1056,6 +1146,7 @@ private:
             .addAttribute(0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, pos))
             .addAttribute(1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal))
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            .setSampleCount(msaaSamples_)
             .build(device_, renderPass_, pipelineLayout_);
     }
 
@@ -1069,13 +1160,17 @@ private:
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
             .setAlphaBlend(true)
             .setDepthWrite(false)
+            .setSampleCount(msaaSamples_)
             .build(device_, renderPass_, pipelineLayout_);
     }
 
     void createFramebuffers() {
         swapChainFramebuffers_.resize(swapChainImageViews_.size());
         for (size_t i = 0; i < swapChainImageViews_.size(); ++i) {
-            std::array<VkImageView, 2> attachments = {swapChainImageViews_[i], depthImageView_};
+            // Order matches createRenderPass: draw into the multisampled pair,
+            // resolve into the swapchain image.
+            std::array<VkImageView, 3> attachments = {colorImageView_, depthImageView_,
+                                                      swapChainImageViews_[i]};
             VkFramebufferCreateInfo ci{};
             ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             ci.renderPass = renderPass_;
@@ -1246,7 +1341,7 @@ private:
         // CMake tracks ImGui master, so this needs the post-move backend.
         info.PipelineInfoMain.RenderPass = renderPass_;
         info.PipelineInfoMain.Subpass = 0;
-        info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        info.PipelineInfoMain.MSAASamples = msaaSamples_;
         ImGui_ImplVulkan_Init(&info); // font atlas uploads lazily since 1.90
     }
 
@@ -1320,30 +1415,60 @@ private:
             using ms = std::chrono::duration<float, std::milli>;
             constexpr float kTargetMs = 16.0f; // ~60 Hz
 
-            float t = 0.0f;
+            // t is wall-clock elapsed rather than a per-iteration increment.
+            // Iterations no longer take a fixed time — they are skipped
+            // entirely for a still surface — so counting them would make
+            // animation speed depend on how expensive the expression is.
+            const auto startTime = clock::now();
+            bool everBuilt = false;
+            uint32_t builtGeneration = 0;
+            float builtX = 0.0f, builtZ = 0.0f;
+
             while (producerRunning_.load(std::memory_order_relaxed)) {
                 auto frameStart = clock::now();
-                t += 0.016f;
+                const float t =
+                    std::chrono::duration<float>(frameStart - startTime).count();
+
+                // Rebuild around wherever the camera is now. Vertex count never
+                // changes, only the region sampled, so the buffer stays valid.
+                const float cx = patchCenterX_.load(std::memory_order_relaxed);
+                const float cz = patchCenterZ_.load(std::memory_order_relaxed);
+                const uint32_t generation = funcGeneration_.load(std::memory_order_acquire);
+
+                // A surface with no t in it, sampled over a patch that has not
+                // moved, comes out identical to the one already uploaded. A
+                // still graph is the common case, and this makes it free.
+                const bool stale = !everBuilt || generation != builtGeneration ||
+                                   cx != builtX || cz != builtZ;
+                if (!stale && !funcAnimated_.load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    continue;
+                }
+                everBuilt = true;
+                builtGeneration = generation;
+                builtX = cx;
+                builtZ = cz;
 
                 // Copy the callable once per snapshot rather than locking
                 // per-vertex: the lock is held for microseconds, and the
-                // ~25k-vertex generate() below runs entirely unlocked.
+                // 100k-vertex sample() below runs entirely unlocked. It also
+                // has to, since sample() calls f from several threads at once
+                // and they cannot all be waiting on one mutex.
                 std::function<float(float, float, float)> f;
                 {
                     std::lock_guard<std::mutex> lock(funcMutex_);
                     f = func_;
                 }
 
+                // Sampled straight into the slot: it is already the right size
+                // from priming, so this reallocates nothing. Only the vertices
+                // are rebuilt — the triangulation depends on the resolution
+                // alone and was uploaded once.
                 uint32_t slot = writeIdx_.load(std::memory_order_relaxed) & (RING_SIZE - 1);
-                // Rebuild around wherever the camera is now. Vertex count never
-                // changes, only the region sampled, so the buffer stays valid.
-                const float cx = patchCenterX_.load(std::memory_order_relaxed);
-                const float cz = patchCenterZ_.load(std::memory_order_relaxed);
-                Mesh m = GraphMesh::generate(
+                GraphMesh::sample(
                     [&](float x, float z) { return f(x, z, t); },
                     cx, cz, cfg::DOMAIN_HALF, cfg::LOD_FALLOFF,
-                    cfg::MESH_RESOLUTION);
-                ring_[slot].vertices = std::move(m.vertices);
+                    cfg::MESH_RESOLUTION, ring_[slot].vertices);
                 writeIdx_.fetch_add(1, std::memory_order_release);
 
                 // Sleep for the remainder of the 16 ms budget.
@@ -1367,9 +1492,12 @@ private:
     // Called once per frame on the render thread — zero allocation, one memcpy.
     void consumeLatestSnapshot() {
         uint32_t w = writeIdx_.load(std::memory_order_acquire);
-        if (w == 0) {
-            return; // no snapshot written yet
+        if (w == 0 || w == uploadedIdx_) {
+            // Nothing new: the buffer already holds this snapshot, and it is a
+            // few megabytes to copy over itself every frame.
+            return;
         }
+        uploadedIdx_ = w;
         const Snapshot& snap = ring_[(w - 1) & (RING_SIZE - 1)];
         std::memcpy(vertexMapped_, snap.vertices.data(),
                     sizeof(Vertex) * snap.vertices.size());
@@ -1395,9 +1523,13 @@ private:
             throw std::runtime_error("failed to begin command buffer");
         }
 
-        std::array<VkClearValue, 2> clears{};
+        // One per attachment. The resolve target is not cleared — it is written
+        // wholesale by the resolve — but the array is indexed by attachment, so
+        // it still needs an entry.
+        std::array<VkClearValue, 3> clears{};
         clears[0].color = {{0.04f, 0.05f, 0.08f, 1.0f}};
         clears[1].depthStencil = {1.0f, 0};
+        clears[2].color = clears[0].color;
 
         VkRenderPassBeginInfo rp{};
         rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1475,6 +1607,10 @@ private:
 
     // ---------------------------------------------------------------- swapchain recreate
     void cleanupSwapChain() {
+        vkDestroyImageView(device_, colorImageView_, nullptr);
+        vkDestroyImage(device_, colorImage_, nullptr);
+        vkFreeMemory(device_, colorImageMemory_, nullptr);
+
         vkDestroyImageView(device_, depthImageView_, nullptr);
         vkDestroyImage(device_, depthImage_, nullptr);
         vkFreeMemory(device_, depthImageMemory_, nullptr);
@@ -1500,6 +1636,7 @@ private:
         cleanupSwapChain();
         createSwapChain();
         createImageViews();
+        createColorResources();
         createDepthResources();
         createFramebuffers();
 

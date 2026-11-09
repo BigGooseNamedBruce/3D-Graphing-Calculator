@@ -95,6 +95,18 @@ public:
 
     bool empty() const { return code_.empty(); }
 
+    // Whether the program reads t, i.e. whether the surface animates. A surface
+    // that does not cannot change while the camera holds still, which is what
+    // lets the renderer skip regenerating it.
+    bool usesTime() const {
+        for (const Instr& in : code_) {
+            if (in.op == Op::VarT) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Worst-case stack use, computed at parse time. Guarantees eval() cannot
     // overflow its fixed-size stack for any expression this class produced.
     static constexpr int kStackDepth = 64;

@@ -39,12 +39,12 @@ vulkan-grapher/
 │   ├── Expression.hpp            # parses f(x,y,t) into a flat postfix program
 │   ├── Camera.hpp                # free-fly camera
 │   ├── Input.hpp                 # keys and mouse -> camera motion
-│   └── GraphMesh.hpp             # samples f(x,y) into a triangle mesh w/ numeric normals
+│   └── GraphMesh.hpp             # samples f(x,y) into a triangle mesh w/ filtered normals
 └── shaders/
     ├── graph.vert                # MVP via push constant
-    ├── graph.frag                # height colormap + Lambert lighting
+    ├── graph.frag                # height colormap + Lambert lighting + distance fog
     ├── grid.vert                 # camera-centred ground quad, no vertex buffer
-    └── grid.frag                 # procedural antialiased grid + distance fade
+    └── grid.frag                 # procedural antialiased grid, LOD decades + distance fade
 ```
 
 ## Expression syntax
@@ -99,18 +99,31 @@ cmake --build build
 ## Notes on the implementation
 
 - **Expressions compile to a flat postfix program, not an AST.** The mesh is
-  160×160 and normals come from central differences, so a rebuild costs about
-  128k evaluations. Walking a contiguous `vector<Instr>` with a small stack beats
-  chasing pointers through a tree of virtual `eval()` calls.
-- **Mesh generation runs off the render thread.** A producer thread rebuilds the
-  surface into a ring buffer and publishes it with a release store, so the frame
-  loop never blocks on evaluation. The producer copies the current callable once
-  per snapshot rather than locking per vertex.
+  320×320 and each vertex is filtered over its own cell, so a rebuild costs
+  around a million evaluations. Walking a contiguous `vector<Instr>` with a small
+  stack beats chasing pointers through a tree of virtual `eval()` calls.
+- **Sample density and sample *filtering* both follow the cell size.** Cells grow
+  geometrically outward, so the rim cell is fifty times the centre one. A vertex
+  there box-filters `f` over its whole cell and takes its normal from the
+  least-squares slope of the same taps, instead of point-sampling a function that
+  may oscillate several times within one cell — which produced a height and a
+  normal that agreed with neither each other nor the triangle drawn from them.
+- **Mesh generation runs off the render thread, and across all of them.** A
+  producer thread rebuilds the surface into a ring buffer and publishes it with a
+  release store, so the frame loop never blocks on evaluation; rows within a
+  rebuild are independent and split over every core. It also skips the rebuild
+  outright when the expression has no `t` in it and the patch has not moved.
 - **The ground grid is procedural, not geometry.** Six vertices built from
   `gl_VertexIndex` form a quad centred on the camera, and the lines are computed
   in the fragment shader with `fwidth()` antialiasing. The grid is therefore
   effectively infinite and stays one pixel wide at any distance — uploaded line
-  geometry aliases into crawling noise once the lines fall between samples.
+  geometry aliases into crawling noise once the lines fall between samples. Three
+  decades (1, 10, 100) are drawn, each fading on how many pixels apart its lines
+  land, so a decade retires before it crowds below a pixel and washes out to grey.
+- **4x MSAA.** Everything renders into a multisampled colour buffer that is
+  resolved into the swapchain image at the end of the single subpass. The far
+  field is mostly triangles a pixel or two across, which is where the last of
+  the aliasing lives once the sampling above is fixed.
 - **Push-constant MVP, no descriptor sets.** The only per-frame uniform is one
   `mat4` (`projection * view`), which fits comfortably in the 128-byte
   push-constant guarantee. This avoids the descriptor pool / uniform buffer
@@ -121,8 +134,9 @@ cmake --build build
 - **macOS / MoltenVK.** The instance enables `VK_KHR_portability_enumeration`
   (and the device enables `VK_KHR_portability_subset` if present), which is
   required for the non-conformant MoltenVK driver.
-- **Resize-safe.** The swapchain (and depth buffer) are recreated on resize and
-  on `VK_ERROR_OUT_OF_DATE_KHR`; the loop pauses while minimized.
+- **Resize-safe.** The swapchain (and the depth and multisample buffers) are
+  recreated on resize and on `VK_ERROR_OUT_OF_DATE_KHR`; the loop pauses while
+  minimized.
 - **Validation layers** are enabled automatically in Debug builds and compiled
   out in Release (`-DCMAKE_BUILD_TYPE=Release`).
 
@@ -130,4 +144,3 @@ cmake --build build
 
 - Axis labels and tick marks for a real "calculator" feel.
 - Adjustable domain and mesh resolution from the UI.
-- MSAA for smoother edges.

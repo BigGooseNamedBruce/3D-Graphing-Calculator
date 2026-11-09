@@ -7,6 +7,11 @@
 // so a line stays about one pixel wide however far away it is. Uploaded line
 // geometry cannot do this: at distance the lines fall between samples and alias
 // into crawling noise.
+//
+// Holding lines at a pixel does mean that far enough away they crowd closer
+// than a pixel apart and stop reading as lines at all. Three decades are drawn
+// rather than one, each fading on how many pixels separate it, so a decade
+// bows out before it turns to grey and the next one up carries the plane.
 
 layout(push_constant) uniform Push {
     mat4 viewProj;
@@ -25,6 +30,13 @@ float coverage(vec2 p, float spacing) {
     return 1.0 - min(min(g.x, g.y), 1.0);
 }
 
+// Visibility of one decade, from how many pixels apart its lines land. Fully in
+// at eight, gone by two — below that coverage() is holding them open past their
+// own spacing, which is the flat grey wash.
+float decadeFade(float spacing, float texel) {
+    return smoothstep(2.0, 8.0, spacing / texel);
+}
+
 void main() {
     // Fade out well inside the quad edge so the boundary is never visible.
     float dist = distance(inWorldXZ, pc.cameraPos.xz);
@@ -40,11 +52,21 @@ void main() {
         return;
     }
 
-    float minor = coverage(inWorldXZ, 1.0);
-    float major = coverage(inWorldXZ, 10.0);
+    // World units per pixel, which is what decides whether a decade is still
+    // resolvable. It grows with distance and, on a plane seen edge-on, with the
+    // grazing angle too — so decades drop out sooner along the horizon, which
+    // is exactly where they used to smear.
+    float texel = max(fwidth(inWorldXZ.x), fwidth(inWorldXZ.y));
 
-    vec3 color = mix(vec3(0.32), vec3(0.55), major);
-    float alpha = max(minor * 0.45, major * 0.85);
+    float minor  = coverage(inWorldXZ, 1.0)   * decadeFade(1.0, texel);
+    float major  = coverage(inWorldXZ, 10.0)  * decadeFade(10.0, texel);
+    float coarse = coverage(inWorldXZ, 100.0) * decadeFade(100.0, texel);
+
+    // Every hundred is also a ten, so where both decades are up they just read
+    // as one brighter line rather than needing a separate weight.
+    float strong = max(major, coarse);
+    vec3 color = mix(vec3(0.32), vec3(0.55), strong);
+    float alpha = max(minor * 0.45, strong * 0.85);
 
     // Axes lying in the ground plane: X red, Z blue.
     vec2 axis = abs(inWorldXZ) / fwidth(inWorldXZ);
